@@ -1,0 +1,5 @@
+.vscode/
+res/
+target/
+Cargo.lock
+src/chip8.rs

@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "chip8-emulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sdl3 = { version = "0.14.36", features = ["build-from-source", "static-link"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
