@@ -1,5 +1,5 @@
 // Namespace imports
-use std::{slice::from_raw_parts_mut, thread::{sleep, yield_now}, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread::{sleep, yield_now}, time::{Duration, Instant}};
 
 use sdl3::{
     audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream},
@@ -9,12 +9,18 @@ use sdl3::{
     sys::render::SDL_LOGICAL_PRESENTATION_INTEGER_SCALE, video::Display
 };
 
+use crate::chip8::Chip8;
+
 // #![windows_subsystem = "windows"]
 extern crate sdl3;
+mod chip8;
 
 // Constants
 const NANOS_IN_SECOND: i64 = 1000000000;
 const CONSOLE_MESSAGES: bool = false;
+
+const BACKGROUND_COLOR: u32 = 0xFF000000;
+const FOREGROUND_COLOR: u32 = 0xFFFFFFFF;
 
 // Allows convenient error handling by returning a message
 fn main() {
@@ -47,7 +53,7 @@ fn app_main() -> Option<&'static str> {
     };
 
     // Initializes window and renderer
-    let sdl_window = match sdl_video_subsystem.window("sdl3-demo", 16 << 6, 9 << 6)
+    let sdl_window = match sdl_video_subsystem.window("chip8-emulator", 16 << 6, 9 << 6)
         .resizable().build() {
             Ok(window) => window,
             Err(_) => return Some("Failed to initialize window!")
@@ -59,19 +65,25 @@ fn app_main() -> Option<&'static str> {
         Err(_) => return Some("Failed to get window's display!")
     };
 
+    // Enables vsync and sets rendering size to 64x32
     sdl3::hint::set(RENDER_VSYNC, "1");
     let mut sdl_canvas = sdl_window.into_canvas();
     if sdl_canvas.set_logical_size(64, 32, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE).is_err() {
         return Some("Failed to set logical size!")
     }
 
+    // Sets the rendering background color
     // texture.set_scale_mode(sdl3::render::ScaleMode::Linear);
-    sdl_canvas.set_draw_color(Color::RGB(0, 0, 255));
+    let agrb8888 = PixelMasks{bpp: 32, rmask: 0x00FF0000, gmask: 0x0000FF00, bmask: 0x000000FF, amask: 0xFF000000};
+    let pixel_format = PixelFormat::from_masks(agrb8888);
+    sdl_canvas.set_draw_color(Color::from_u32(&pixel_format, BACKGROUND_COLOR));
 
     // Initializes audio stream with callback
     let audio_spec = AudioSpec{freq: Some(48000), channels: Some(1), format: Some(AudioFormat::s16_sys())};
+    let is_audio_playing = Arc::new(AtomicBool::new(false));
     let sdl_audio_stream = match sdl_audio_subsystem.default_playback_device()
-        .open_playback_stream_with_callback(&audio_spec, AudioState{buffer: Vec::new(), phase: 0, previous: 0}) {
+        .open_playback_stream_with_callback(&audio_spec, AudioState{buffer: Vec::new(), phase: 0, previous: 0,
+        is_playing: is_audio_playing.clone()}) {
         Ok(stream) => stream,
         Err(_) => return Some("Failed to initialize audio stream!")
     };
@@ -83,8 +95,6 @@ fn app_main() -> Option<&'static str> {
 
     // Initializes texture on the gpu to blit to
     let texture_creator = sdl_canvas.texture_creator();
-    let agrb8888 = PixelMasks{bpp: 32, rmask: 0x00FF0000, gmask: 0x0000FF00, bmask: 0x000000FF, amask: 0xFF000000};
-    let pixel_format = PixelFormat::from_masks(agrb8888);
     let mut sdl_texture = match texture_creator.create_texture_streaming(pixel_format, 64, 32) {
         Ok(texture) => texture,
         Err(_) => return Some("Failed to initialize texture!")
@@ -94,6 +104,12 @@ fn app_main() -> Option<&'static str> {
     let mut refresh_time_nanos = match sdl3_get_refresh_time(sdl_display) {
         Some(time) => time,
         None => return None
+    };
+
+    // Initializes the chip8 emulation context
+    let mut chip8_context =  match Chip8::init() {
+        Ok(context) => context,
+        Err(msg) => return Some(msg)
     };
 
     // Frame timing variables
@@ -116,6 +132,23 @@ fn app_main() -> Option<&'static str> {
                     Some(Keycode::Escape) => return None,
                     Some(Keycode::Up) => if blue_shade < 255 {blue_shade += 1},
                     Some(Keycode::Down) => if blue_shade > 0 {blue_shade -= 1},
+                    Some(Keycode::Space) => chip8_context.sound_timer += 60,
+                    Some(Keycode::_1) => chip8_context.keyboard[chip8::Key::X1 as usize] = 1,
+                    Some(Keycode::_2) => chip8_context.keyboard[chip8::Key::X2 as usize] = 1,
+                    Some(Keycode::_3) => chip8_context.keyboard[chip8::Key::X3 as usize] = 1,
+                    Some(Keycode::_4) => chip8_context.keyboard[chip8::Key::XC as usize] = 1,
+                    Some(Keycode::Q)  => chip8_context.keyboard[chip8::Key::X4 as usize] = 1,
+                    Some(Keycode::W)  => chip8_context.keyboard[chip8::Key::X5 as usize] = 1,
+                    Some(Keycode::E)  => chip8_context.keyboard[chip8::Key::X6 as usize] = 1,
+                    Some(Keycode::R)  => chip8_context.keyboard[chip8::Key::XD as usize] = 1,
+                    Some(Keycode::A)  => chip8_context.keyboard[chip8::Key::X7 as usize] = 1,
+                    Some(Keycode::S)  => chip8_context.keyboard[chip8::Key::X8 as usize] = 1,
+                    Some(Keycode::D)  => chip8_context.keyboard[chip8::Key::X9 as usize] = 1,
+                    Some(Keycode::F)  => chip8_context.keyboard[chip8::Key::XE as usize] = 1,
+                    Some(Keycode::Z)  => chip8_context.keyboard[chip8::Key::XA as usize] = 1,
+                    Some(Keycode::X)  => chip8_context.keyboard[chip8::Key::X0 as usize] = 1,
+                    Some(Keycode::C)  => chip8_context.keyboard[chip8::Key::XB as usize] = 1,
+                    Some(Keycode::V)  => chip8_context.keyboard[chip8::Key::XF as usize] = 1,
                     _ => ()
                 },
 
@@ -151,11 +184,21 @@ fn app_main() -> Option<&'static str> {
         while frame_delta > UPDATE_DELTA {
             frame_delta -= UPDATE_DELTA;
 
-            // Updates texture with pixel buffer
+            // Emulates chip8 for 1/60th of a second
+            chip8_context.run();
+
+            // Plays audio if the sound timer is not 0
+            is_audio_playing.store(chip8_context.sound_timer > 0, Ordering::Release);
+            
+            // Updates pixel buffer with frame buffer
             // texture.with_lock(None, |pixel_data, pitch| {});
-            for pixel in pixel_buffer.chunks_exact_mut(4) {
-                let bytes = 0xFF000000u32 | blue_shade;
-                pixel.copy_from_slice(&bytes.to_le_bytes());
+            for (pixel, state) in pixel_buffer.chunks_exact_mut(4)
+                .zip(chip8_context.frame_buffer.iter()) {
+                    let color = match state {
+                        0 => BACKGROUND_COLOR | blue_shade,
+                        _ => FOREGROUND_COLOR
+                    };
+                    pixel.copy_from_slice(&color.to_le_bytes());
             }
         }
 
@@ -250,11 +293,15 @@ fn app_main() -> Option<&'static str> {
 struct AudioState {
     buffer: Vec<i16>,
     phase: u16,
-    previous: i16
+    previous: i16,
+    is_playing: Arc<AtomicBool>
 }
 
 impl AudioCallback<i16> for AudioState {
     fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
+        // Does not fill the stream if the emulator is not playing audio
+        if !self.is_playing.load(Ordering::Acquire) { return }
+
         // Sets buffer length to zero for next iteration
         self.buffer.clear();
 
@@ -286,7 +333,7 @@ fn sdl3_get_refresh_time(display: Display) -> Option<i64> {
         Ok(mode) => mode,
         Err(_) => {
             println!("Failed to get display mode!");
-            return None;
+            return None
         }
     };
     Some((NANOS_IN_SECOND as f32 / display_mode.refresh_rate) as i64)
