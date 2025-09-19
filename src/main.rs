@@ -1,5 +1,5 @@
 // Namespace imports
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread::{sleep, yield_now}, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicI32, Ordering}, Arc}, thread::{sleep, yield_now}, time::{Duration, Instant}};
 
 use sdl3::{
     audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream},
@@ -16,6 +16,11 @@ extern crate sdl3;
 mod chip8;
 
 // Constants
+const SDL3_CHIP8_KEY_MAP: [Keycode; 16] = [
+    Keycode::X, Keycode::_1, Keycode::_2, Keycode::_3, Keycode::Q, Keycode::W, Keycode::E, Keycode::A,
+    Keycode::S, Keycode::D, Keycode::Z, Keycode::C, Keycode::_4, Keycode::R, Keycode::F, Keycode::V,
+];
+    
 const NANOS_IN_SECOND: i64 = 1000000000;
 const CONSOLE_MESSAGES: bool = false;
 
@@ -73,17 +78,16 @@ fn app_main() -> Option<&'static str> {
     }
 
     // Sets the rendering background color
-    // texture.set_scale_mode(sdl3::render::ScaleMode::Linear);
     let agrb8888 = PixelMasks{bpp: 32, rmask: 0x00FF0000, gmask: 0x0000FF00, bmask: 0x000000FF, amask: 0xFF000000};
     let pixel_format = PixelFormat::from_masks(agrb8888);
     sdl_canvas.set_draw_color(Color::from_u32(&pixel_format, BACKGROUND_COLOR));
 
     // Initializes audio stream with callback
     let audio_spec = AudioSpec{freq: Some(48000), channels: Some(1), format: Some(AudioFormat::s16_sys())};
-    let is_audio_playing = Arc::new(AtomicBool::new(false));
+    let remaining_samples = Arc::new(AtomicI32::new(0));
     let sdl_audio_stream = match sdl_audio_subsystem.default_playback_device()
         .open_playback_stream_with_callback(&audio_spec, AudioState{buffer: Vec::new(), phase: 0, previous: 0,
-        is_playing: is_audio_playing.clone()}) {
+        remaining_samples: remaining_samples.clone()}) {
         Ok(stream) => stream,
         Err(_) => return Some("Failed to initialize audio stream!")
     };
@@ -99,6 +103,7 @@ fn app_main() -> Option<&'static str> {
         Ok(texture) => texture,
         Err(_) => return Some("Failed to initialize texture!")
     };
+    sdl_texture.set_scale_mode(sdl3::render::ScaleMode::Nearest);
 
     // Gets refresh rate from primary display
     let mut refresh_time_nanos = match sdl3_get_refresh_time(sdl_display) {
@@ -119,8 +124,8 @@ fn app_main() -> Option<&'static str> {
     let mut frame_delta_buffer = 0;
 
     // Rendering variables
+    let mut previous_sound_timer = 0;
     let mut pixel_buffer = [0; 64 * 32 * 4];
-    let mut blue_shade = 0x80;
 
     loop {
         // Event loop
@@ -128,28 +133,19 @@ fn app_main() -> Option<&'static str> {
             match event {
                 // Quits application and reads keyboard
                 Event::Quit {..} => return None,
-                Event::KeyDown{keycode, ..} => match keycode {
-                    Some(Keycode::Escape) => return None,
-                    Some(Keycode::Up) => if blue_shade < 255 {blue_shade += 1},
-                    Some(Keycode::Down) => if blue_shade > 0 {blue_shade -= 1},
-                    Some(Keycode::Space) => chip8_context.sound_timer += 60,
-                    Some(Keycode::_1) => chip8_context.keyboard[chip8::Key::X1 as usize] = 1,
-                    Some(Keycode::_2) => chip8_context.keyboard[chip8::Key::X2 as usize] = 1,
-                    Some(Keycode::_3) => chip8_context.keyboard[chip8::Key::X3 as usize] = 1,
-                    Some(Keycode::_4) => chip8_context.keyboard[chip8::Key::XC as usize] = 1,
-                    Some(Keycode::Q)  => chip8_context.keyboard[chip8::Key::X4 as usize] = 1,
-                    Some(Keycode::W)  => chip8_context.keyboard[chip8::Key::X5 as usize] = 1,
-                    Some(Keycode::E)  => chip8_context.keyboard[chip8::Key::X6 as usize] = 1,
-                    Some(Keycode::R)  => chip8_context.keyboard[chip8::Key::XD as usize] = 1,
-                    Some(Keycode::A)  => chip8_context.keyboard[chip8::Key::X7 as usize] = 1,
-                    Some(Keycode::S)  => chip8_context.keyboard[chip8::Key::X8 as usize] = 1,
-                    Some(Keycode::D)  => chip8_context.keyboard[chip8::Key::X9 as usize] = 1,
-                    Some(Keycode::F)  => chip8_context.keyboard[chip8::Key::XE as usize] = 1,
-                    Some(Keycode::Z)  => chip8_context.keyboard[chip8::Key::XA as usize] = 1,
-                    Some(Keycode::X)  => chip8_context.keyboard[chip8::Key::X0 as usize] = 1,
-                    Some(Keycode::C)  => chip8_context.keyboard[chip8::Key::XB as usize] = 1,
-                    Some(Keycode::V)  => chip8_context.keyboard[chip8::Key::XF as usize] = 1,
-                    _ => ()
+                Event::KeyDown{keycode: Some(sdl_key), ..} => {
+                    for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
+                        if sdl_key == SDL3_CHIP8_KEY_MAP[chip8_key] {
+                            chip8_context.keyboard[chip8_key] = 1;
+                        }
+                    }
+                },
+                Event::KeyUp{keycode: Some(sdl_key), ..} => {
+                    for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
+                        if sdl_key == SDL3_CHIP8_KEY_MAP[chip8_key] {
+                            chip8_context.keyboard[chip8_key] = 0;
+                        }
+                    }
                 },
 
                 // Changes display and recalculates refresh rate when moved
@@ -185,17 +181,23 @@ fn app_main() -> Option<&'static str> {
             frame_delta -= UPDATE_DELTA;
 
             // Emulates chip8 for 1/60th of a second
-            chip8_context.run();
+            if let Some(message) = chip8_context.run() {
+                println!("{message}");
+                return None
+            }
 
-            // Plays audio if the sound timer is not 0
-            is_audio_playing.store(chip8_context.sound_timer > 0, Ordering::Release);
+            // Sets the remaining samples when the sound timer changes
+            if previous_sound_timer != chip8_context.sound_timer - 1 {
+                remaining_samples.store(chip8_context.sound_timer as i32 * 48000 / 60, Ordering::Release);    
+            }
+            previous_sound_timer = chip8_context.sound_timer;
             
             // Updates pixel buffer with frame buffer
             // texture.with_lock(None, |pixel_data, pitch| {});
             for (pixel, state) in pixel_buffer.chunks_exact_mut(4)
                 .zip(chip8_context.frame_buffer.iter()) {
                     let color = match state {
-                        0 => BACKGROUND_COLOR | blue_shade,
+                        0 => BACKGROUND_COLOR,
                         _ => FOREGROUND_COLOR
                     };
                     pixel.copy_from_slice(&color.to_le_bytes());
@@ -294,21 +296,22 @@ struct AudioState {
     buffer: Vec<i16>,
     phase: u16,
     previous: i16,
-    is_playing: Arc<AtomicBool>
+    remaining_samples: Arc<AtomicI32>
 }
 
 impl AudioCallback<i16> for AudioState {
-    fn callback(&mut self, stream: &mut AudioStream, requested: i32) {
-        // Does not fill the stream if the emulator is not playing audio
-        if !self.is_playing.load(Ordering::Acquire) { return }
+    fn callback(&mut self, stream: &mut AudioStream, mut requested: i32) {
+        // Caps the played samples at the remaining samples
+        let remaining_samples = self.remaining_samples.fetch_sub(requested, Ordering::AcqRel);
+        if remaining_samples < requested { requested = remaining_samples; }
 
         // Sets buffer length to zero for next iteration
         self.buffer.clear();
 
-        for _ in 0..requested as usize {
+        for _ in 0..requested {
             // Calculates sample from square wave phase
             const HALF_PERIOD_SAMPLES: u16 = (48000.0 / (261.63 * 2.0)) as u16;
-            const VOLUME: i16 = 512;
+            const VOLUME: i16 = 1024;
             let square = match self.phase < HALF_PERIOD_SAMPLES {
                 true => VOLUME,
                 false => -VOLUME,
