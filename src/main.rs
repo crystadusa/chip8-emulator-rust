@@ -187,7 +187,7 @@ fn app_main() -> Option<&'static str> {
             }
 
             // Sets the remaining samples when the sound timer changes
-            if previous_sound_timer != chip8_context.sound_timer - 1 {
+            if previous_sound_timer + 1 != chip8_context.sound_timer {
                 remaining_samples.store(chip8_context.sound_timer as i32 * 48000 / 60, Ordering::Release);    
             }
             previous_sound_timer = chip8_context.sound_timer;
