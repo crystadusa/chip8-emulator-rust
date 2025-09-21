@@ -9,11 +9,10 @@ use sdl3::{
     sys::render::SDL_LOGICAL_PRESENTATION_INTEGER_SCALE, video::Display
 };
 
-use crate::chip8::Chip8;
-
 // #![windows_subsystem = "windows"]
-extern crate sdl3;
 mod chip8;
+use crate::chip8::Chip8;
+extern crate sdl3;
 
 // Constants
 const SDL3_CHIP8_KEY_MAP: [Keycode; 16] = [
@@ -23,9 +22,6 @@ const SDL3_CHIP8_KEY_MAP: [Keycode; 16] = [
     
 const NANOS_IN_SECOND: i64 = 1000000000;
 const CONSOLE_MESSAGES: bool = false;
-
-const BACKGROUND_COLOR: u32 = 0xFF000000;
-const FOREGROUND_COLOR: u32 = 0xFFFFFFFF;
 
 // Allows convenient error handling by returning a message
 fn main() {
@@ -80,7 +76,7 @@ fn app_main() -> Option<&'static str> {
     // Sets the rendering background color
     let agrb8888 = PixelMasks{bpp: 32, rmask: 0x00FF0000, gmask: 0x0000FF00, bmask: 0x000000FF, amask: 0xFF000000};
     let pixel_format = PixelFormat::from_masks(agrb8888);
-    sdl_canvas.set_draw_color(Color::from_u32(&pixel_format, BACKGROUND_COLOR));
+    sdl_canvas.set_draw_color(Color::from_u32(&pixel_format, chip8::BACKGROUND_COLOR));
 
     // Initializes audio stream with callback
     let audio_spec = AudioSpec{freq: Some(48000), channels: Some(1), format: Some(AudioFormat::s16_sys())};
@@ -99,7 +95,8 @@ fn app_main() -> Option<&'static str> {
 
     // Initializes texture on the gpu to blit to
     let texture_creator = sdl_canvas.texture_creator();
-    let mut sdl_texture = match texture_creator.create_texture_streaming(pixel_format, 64, 32) {
+    let mut sdl_texture = match texture_creator.create_texture_streaming(pixel_format,
+         chip8::FRAME_BUFFER_WIDTH as u32, chip8::FRAME_BUFFER_HEIGHT as u32) {
         Ok(texture) => texture,
         Err(_) => return Some("Failed to initialize texture!")
     };
@@ -123,10 +120,6 @@ fn app_main() -> Option<&'static str> {
     let mut frame_delta = 0;
     let mut frame_delta_buffer = 0;
 
-    // Rendering variables
-    let mut previous_sound_timer = 0;
-    let mut pixel_buffer = [0; 64 * 32 * 4];
-
     loop {
         // Event loop
         for event in sdl_event_pump.poll_iter() {
@@ -136,14 +129,15 @@ fn app_main() -> Option<&'static str> {
                 Event::KeyDown{keycode: Some(sdl_key), ..} => {
                     for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
                         if sdl_key == SDL3_CHIP8_KEY_MAP[chip8_key] {
-                            chip8_context.keyboard[chip8_key] = 1;
+                            chip8_context.keyboard[chip8_key] = true;
                         }
                     }
                 },
                 Event::KeyUp{keycode: Some(sdl_key), ..} => {
                     for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
                         if sdl_key == SDL3_CHIP8_KEY_MAP[chip8_key] {
-                            chip8_context.keyboard[chip8_key] = 0;
+                            chip8_context.keyboard[chip8_key] = false;
+                            chip8_context.key_released[chip8_key] = true;
                         }
                     }
                 },
@@ -182,30 +176,18 @@ fn app_main() -> Option<&'static str> {
 
             // Emulates chip8 for 1/60th of a second
             if let Some(message) = chip8_context.run() {
-                println!("{message}");
-                return None
+                return Some(message)
             }
 
             // Sets the remaining samples when the sound timer changes
-            if previous_sound_timer + 1 != chip8_context.sound_timer {
-                remaining_samples.store(chip8_context.sound_timer as i32 * 48000 / 60, Ordering::Release);    
-            }
-            previous_sound_timer = chip8_context.sound_timer;
-            
-            // Updates pixel buffer with frame buffer
-            // texture.with_lock(None, |pixel_data, pitch| {});
-            for (pixel, state) in pixel_buffer.chunks_exact_mut(4)
-                .zip(chip8_context.frame_buffer.iter()) {
-                    let color = match state {
-                        0 => BACKGROUND_COLOR,
-                        _ => FOREGROUND_COLOR
-                    };
-                    pixel.copy_from_slice(&color.to_le_bytes());
+            if let Some(samples) = chip8_context.remaining_samples {
+                remaining_samples.store(samples, Ordering::Release);
+                chip8_context.remaining_samples = None;
             }
         }
 
         // let pixel_buffer_u8 = from_raw_parts_mut(pixel_buffer.as_mut_ptr().cast(), pixel_buffer.len() * 4);
-        if sdl_texture.update(None, &pixel_buffer, 64 * 4).is_err() {
+        if sdl_texture.update(None, chip8_context.frame_buffer.as_slice(), chip8::FRAME_BUFFER_WIDTH as usize * 4).is_err() {
             return Some("Failed to update texture!")
         }
 

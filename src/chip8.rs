@@ -1,12 +1,15 @@
 // Namespace imports
+use std::env;
 use rand::{rngs::SmallRng, RngCore, SeedableRng};
-
 extern crate rand;
 
 // Constants
+pub const BACKGROUND_COLOR: u32 = 0xFF000000;
+const FOREGROUND_COLOR: u32 = 0xFFFFFFFF;
 const FLAGS_REGISTER: usize = 0xF;
-const FRAME_BUFFER_WIDTH: u16 = 64;
-const FRAME_BUFFER_HEIGHT: u16 = 32;
+pub const FRAME_BUFFER_WIDTH: u16 = 64;
+pub const FRAME_BUFFER_HEIGHT: u16 = 32;
+const FRAME_BUFFER_SIZE: usize = FRAME_BUFFER_WIDTH as usize * FRAME_BUFFER_HEIGHT as usize * 4;
 const MAX_RAM_ADDRESS: u16 = 0x1000 - 0x160; // Last 0x160 bytes are reserved
 const SPRITE_WIDTH: u8 = 8;
 
@@ -33,11 +36,14 @@ const FONTS: [u8; 0x50] = [
 // The chip8 state which can be initialized and ran
 pub struct Chip8 {
     ram: Box<[u8; MAX_RAM_ADDRESS as usize]>,
-    pub frame_buffer: Box<[u8; 64 * 32]>,
+    pub frame_buffer: Box<[u8; FRAME_BUFFER_SIZE]>,
     stack: Box<[u16; 12]>,
-    previous_keyboard: Box<[u8; 16]>,
-    pub keyboard: Box<[u8; 16]>,
+    pub key_released: Box<[bool; 16]>,
+    pub keyboard: Box<[bool; 16]>,
     random_generator: SmallRng,
+    pub remaining_samples: Option<i32>,
+    clock_hz: u32,
+    clock_buffer: u32,
 
     program_counter: u16,
     index_register: u16,
@@ -49,10 +55,60 @@ pub struct Chip8 {
 
 impl Chip8 {
     pub fn init() -> Result<Chip8, &'static str> {
-        // Reads file path from command line
-        let rom_path = match std::env::args().skip(1).next() {
-            Some(path) => path,
-            None => return Err("Missing path to the rom!")
+        // Reads file path and clock speed from the command line
+        let mut rom_path = String::from("");
+        let mut clock_per_sec = None;
+
+        let mut args =  env::args().skip(1);
+        loop {
+            // Exits iterator at the end of the environment args
+            let arg = match args.next() {
+                Some(arg) => arg,
+                None => break
+            };
+
+            // Parses command parameters and the numerical postfix
+            let arg_type = arg.trim_end_matches(char::is_numeric);
+            match arg_type {
+                "-c" | "-clock" => {
+                    if let Some(_) = clock_per_sec {
+                        return Err("Clock speed is already set!")
+                    }
+
+                    // Reads clock speed argument with or without a space
+                    let value = match arg.len() == arg_type.len() {
+                        false => String::from(&arg[arg_type.len()..]),
+                        true => match args.next() {
+                            Some(arg) => arg,
+                            None => return Err("Clock speed is missing!")
+                        }
+                    };
+
+                    // Parses clock speed argument as a number
+                    match value.parse::<u32>() {
+                        Ok(arg) => clock_per_sec = Some(arg),
+                        Err(_) => return Err("Clock speed is not a number!")
+                    }
+                }
+
+                // Accepts at most one rom path
+                _ => match rom_path.as_str() {
+                    "" => rom_path = arg,
+                    _ => return Err("Rom path is already set!")
+                }
+            }
+        }
+
+        // Terminates without a rom path
+        if rom_path == "" {
+            return Err("Missing path to the rom!")
+        }
+
+        // Terminates when the clock is zero and sets default to 500
+        let clock_per_sec = match clock_per_sec {
+            None => 500, // Default clock hz
+            Some(0) => return Err("Clock speed must be greater than zero!"),
+            Some(hz) => hz
         };
 
         // Reads rom from file
@@ -74,9 +130,9 @@ impl Chip8 {
         let rng = rand::rngs::SmallRng::from_os_rng();
 
         // Initializes registers and memory to zero, and program counter to 0x200
-        Ok(Chip8 {ram, frame_buffer: Box::new([0; 64 * 32]), stack: Box::new([0; 12]), previous_keyboard: Box::new([0; 16]), keyboard: Box::new([0; 16]),
-            random_generator: rng, program_counter: 0x200, index_register: 0, stack_pointer: 0, delay_timer: 0, sound_timer: 0,
-            general_registers: [0; 16]})
+        Ok(Chip8 {ram, frame_buffer: Box::new([0; FRAME_BUFFER_SIZE]), stack: Box::new([0; 12]), key_released: Box::new([false; 16]), keyboard: Box::new([false; 16]),
+            random_generator: rng, remaining_samples: None, clock_hz: clock_per_sec, clock_buffer: 0, program_counter: 0x200, index_register: 0, stack_pointer: 0, 
+            delay_timer: 0, sound_timer: 0, general_registers: [0; 16]})
     }
 
     pub fn run(&mut self) -> Option<&'static str> {
@@ -84,8 +140,14 @@ impl Chip8 {
         if self.delay_timer > 0 { self.delay_timer -= 1; }
         if self.sound_timer > 0 { self.sound_timer -= 1; }
 
-        // Runs 480 instructions a second or 8 per frame at 60 fps
-        'run_loop: for _ in 0..8 {
+        // Subtracts 1/60th of a second increments from 1/clock_hz second increments to calculate cycles in a frame
+        // A buffer transfers the time not emulated to the next frame
+        self.clock_buffer += self.clock_hz;
+        let cycles = self.clock_buffer / 60;
+        self.clock_buffer %= 60;
+
+        // Runs self.clock_hz instructions a second at 60 fps
+        'run_loop: for cycle in 0..cycles {
             // Terminates if the program counter is out of range or unaligned
             if self.program_counter < 0x200 || self.program_counter >= MAX_RAM_ADDRESS || self.program_counter % 2 == 1{
                 return Some("Invalid program counter address!")
@@ -102,7 +164,9 @@ impl Chip8 {
             match op0 {
                 0x0 => match nnn {
                     // opcode CLS - clears the display
-                    0x0E0 => self.frame_buffer.fill(0),
+                    0x0E0 => for pixel in self.frame_buffer.chunks_exact_mut(4) {
+                        pixel.copy_from_slice(&BACKGROUND_COLOR.to_le_bytes());
+                    }
 
                     // opcode RET - returns from subroutine
                     0x0EE => {
@@ -262,14 +326,18 @@ impl Chip8 {
                             // The row data is a bit field for the pixel data
                             let is_pixel_set = (row_data >> (SPRITE_WIDTH - 1 - j)) & 1;
 
+                            // Xor's the sprite with the frame buffer to draw
                             // Sets the flags register to 1 if another sprite is erased
                             let pixel_index = row_index + (x + j) as u16;
-                            if self.frame_buffer[pixel_index as usize] == 1 && is_pixel_set == 1 {
-                                self.general_registers[FLAGS_REGISTER] = 1;
+                            let pixel = &mut self.frame_buffer[pixel_index as usize * 4..(pixel_index as usize + 1) * 4];
+                            match (pixel == FOREGROUND_COLOR.to_le_bytes(), is_pixel_set) {
+                                (false, 0) => pixel.copy_from_slice(&BACKGROUND_COLOR.to_le_bytes()),
+                                (false, _) | (true, 0) => pixel.copy_from_slice(&FOREGROUND_COLOR.to_le_bytes()),
+                                (true, _) => {
+                                    self.general_registers[FLAGS_REGISTER] = 1;
+                                    pixel.copy_from_slice(&BACKGROUND_COLOR.to_le_bytes());
+                                }
                             }
-
-                            // Xor's the sprite with the frame buffer to draw
-                            self.frame_buffer[pixel_index as usize] ^= is_pixel_set;
                         }
                     }
 
@@ -280,10 +348,10 @@ impl Chip8 {
 
                 0xE => match opcode[1] {
                     // opcode SKP Vx - skips instruction if the key value in register x is pressed
-                    0x9E => if self.keyboard[self.general_registers[x as usize] as usize & 0xF] == 1 { self.program_counter += 2; },
+                    0x9E => if self.keyboard[self.general_registers[x as usize] as usize & 0xF] { self.program_counter += 2; },
                     
                     // opcode SKP Vx - skips instruction if the key value in register x is not pressed
-                    0xA1 => if self.keyboard[self.general_registers[x as usize] as usize & 0xF] == 0 { self.program_counter += 2; },
+                    0xA1 => if !self.keyboard[self.general_registers[x as usize] as usize & 0xF] { self.program_counter += 2; },
                     _ => return Some("Unsupported opcode!")
                 }
 
@@ -296,9 +364,9 @@ impl Chip8 {
                         let mut is_key_pressed = false;
                         for i in 0..self.keyboard.len() {
                             // Iterates to find a released key
-                            if self.previous_keyboard[i] == 1 && self.keyboard[i] == 0 {
-                                // Updates the key state from released to unpressed
-                                self.previous_keyboard[i] = 1;
+                            if self.key_released[i] {
+                                // Handles the release to avoid repeat detections
+                                self.key_released[i] = false;
 
                                 // Returns the released key in register x
                                 self.general_registers[x as usize] = i as u8;
@@ -317,9 +385,12 @@ impl Chip8 {
                     // opcode LD ST, Vx - register x is loaded in the sound timer
                     // a value of 1 is not responded to on original hardware
                     0x18 => {
-                        match self.general_registers[x as usize] {
-                            1 => self.sound_timer = 0,
-                            _ => self.sound_timer = self.general_registers[x as usize]
+                        self.sound_timer = self.general_registers[x as usize];
+
+                        if self.sound_timer > 1 {
+                            // Calculates the number of audio samples in the sound timer's duration
+                            let elapsed_frame_samples = (cycle as f32 / cycles as f32 * (48000.0 / 60.0)) as i32;
+                            self.remaining_samples = Some(self.sound_timer as i32 * 48000 / 60 - elapsed_frame_samples);
                         }
                     },
 
@@ -379,7 +450,7 @@ impl Chip8 {
         }
 
         // Keeps track of the previous keyboard state to know when a key is pressed or released
-        self.previous_keyboard.copy_from_slice(self.keyboard.as_slice());
+        self.key_released.fill(false);
         None
     }
 }
