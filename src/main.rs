@@ -6,12 +6,14 @@ use sdl3::{
     event::{DisplayEvent, Event, WindowEvent},
     hint::names::RENDER_VSYNC, keyboard::Keycode,
     pixels::{Color, PixelFormat, PixelMasks},
-    sys::render::SDL_LOGICAL_PRESENTATION_INTEGER_SCALE, video::Display
+    render::ScaleMode, sys::{render::SDL_LOGICAL_PRESENTATION_INTEGER_SCALE},
+    video::{Display, FullscreenType, WindowPos}
 };
 
 // #![windows_subsystem = "windows"]
 mod chip8;
-use crate::chip8::Chip8;
+mod config;
+use crate::{chip8::Chip8, config::Chip8Configuration};
 extern crate sdl3;
 
 // Constants
@@ -53,21 +55,67 @@ fn app_main() -> Option<&'static str> {
         Err(_) => return Some("Failed to initialize video subsystem!")
     };
 
-    // Initializes window and renderer
-    let sdl_window = match sdl_video_subsystem.window("chip8-emulator", 16 << 6, 9 << 6)
-        .resizable().build() {
-            Ok(window) => window,
-            Err(_) => return Some("Failed to initialize window!")
-    };
-    
-    // Initializes window's display to get refresh rate
-    let mut sdl_display = match sdl_window.get_display() {
-        Ok(display) => display,
-        Err(_) => return Some("Failed to get window's display!")
+    // Initializes window
+    let mut sdl_window = match sdl_video_subsystem.window("chip8-emulator", 0, 0)
+    .hidden().resizable().build() {
+        Ok(window) => window,
+        Err(_) => return Some("Failed to initialize window!")
     };
 
-    // Enables vsync and sets rendering size to 64x32
-    sdl3::hint::set(RENDER_VSYNC, "1");
+    // Initializes the primary display to get its resolution and refresh rate
+    let mut sdl_display = match sdl_video_subsystem.get_primary_display() {
+        Ok(display) => display,
+        Err(_) => return Some("Failed to get primary display!")
+    };
+
+    // Gets configuration for this emulator
+    let chip8_configuration = match Chip8Configuration::parse(&sdl_window, &mut sdl_event_pump) {
+        Ok(config) => config,
+        Err(msg) => match msg {
+            "" => return Some(msg),
+            _ => {
+                println!("{msg}");
+                return Some("Run \"chip8-emulator -h\" for more information.")
+            }
+        }
+    };
+
+    // Initializes the chip8 emulation context
+    let mut chip8_context =  match Chip8::init(&chip8_configuration) {
+        Ok(context) => context,
+        Err(msg) => return Some(msg)
+    };
+
+    // Sets fullscreen mode from configuration
+    if sdl_window.set_fullscreen(chip8_configuration.is_fullscreen).is_err() {
+        return Some("Failed to set fullscreen mode!");
+    }
+
+    // Enables vsync based on configuration
+    if chip8_configuration.is_vsync { sdl3::hint::set(RENDER_VSYNC, "1"); }
+
+    // Calculates window size based on scale factor, pixel dimensions, or half the monitor resolution
+    let (window_width, window_height) = match chip8_configuration.window_size {
+        None => match sdl_display.get_mode() {
+            // Sets the window size to half the highest integer scale
+            Ok(mode) => (mode.w as u32 / 64 * 32, mode.h as u32 / 32 * 16),
+            Err(_) => return Some("Failed to get display mode!")
+        }
+        Some(size) => match size {
+            // Calculates window size from an integer scale chip8 (64x32) resolution
+            Err(scale) => (64 * scale, 32 * scale),
+            Ok(size) => size,
+        }
+    };
+
+    // Sets window size, centers it, and shows it
+    if sdl_window.set_size(window_width, window_height).is_err() {
+        return Some("Failed to set window size!")
+    }
+    sdl_window.set_position(WindowPos::Centered, WindowPos::Centered);
+    sdl_window.show();
+
+    // Sets rendering size to 64x32
     let mut sdl_canvas = sdl_window.into_canvas();
     if sdl_canvas.set_logical_size(64, 32, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE).is_err() {
         return Some("Failed to set logical size!")
@@ -76,13 +124,13 @@ fn app_main() -> Option<&'static str> {
     // Sets the rendering background color
     let agrb8888 = PixelMasks{bpp: 32, rmask: 0x00FF0000, gmask: 0x0000FF00, bmask: 0x000000FF, amask: 0xFF000000};
     let pixel_format = PixelFormat::from_masks(agrb8888);
-    sdl_canvas.set_draw_color(Color::from_u32(&pixel_format, chip8::BACKGROUND_COLOR));
+    sdl_canvas.set_draw_color(Color::from_u32(&pixel_format, chip8_configuration.background_color));
 
     // Initializes audio stream with callback
     let audio_spec = AudioSpec{freq: Some(48000), channels: Some(1), format: Some(AudioFormat::s16_sys())};
     let remaining_samples = Arc::new(AtomicI32::new(0));
     let sdl_audio_stream = match sdl_audio_subsystem.default_playback_device()
-        .open_playback_stream_with_callback(&audio_spec, AudioState{buffer: Vec::new(), phase: 0, previous: 0,
+    .open_playback_stream_with_callback(&audio_spec, AudioState{buffer: Vec::new(), phase: 0, previous: 0,
         remaining_samples: remaining_samples.clone()}) {
         Ok(stream) => stream,
         Err(_) => return Some("Failed to initialize audio stream!")
@@ -100,7 +148,7 @@ fn app_main() -> Option<&'static str> {
         Ok(texture) => texture,
         Err(_) => return Some("Failed to initialize texture!")
     };
-    sdl_texture.set_scale_mode(sdl3::render::ScaleMode::Nearest);
+    sdl_texture.set_scale_mode(ScaleMode::Nearest);
 
     // Gets refresh rate from primary display
     let mut refresh_time_nanos = match sdl3_get_refresh_time(sdl_display) {
@@ -108,32 +156,41 @@ fn app_main() -> Option<&'static str> {
         None => return None
     };
 
-    // Initializes the chip8 emulation context
-    let mut chip8_context =  match Chip8::init() {
-        Ok(context) => context,
-        Err(msg) => return Some(msg)
-    };
-
     // Frame timing variables
-    let mut is_vsync = true;
+    let mut is_vsync = chip8_configuration.is_vsync;
     let mut start_time = Instant::now();
     let mut frame_delta = 0;
     let mut frame_delta_buffer = 0;
-
+    
     loop {
         // Event loop
         for event in sdl_event_pump.poll_iter() {
             match event {
                 // Quits application and reads keyboard
                 Event::Quit {..} => return None,
-                Event::KeyDown{keycode: Some(sdl_key), ..} => {
-                    for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
+
+                Event::KeyDown{keycode: Some(sdl_key), ..} => match sdl_key {
+                    // Terminates emulator
+                    Keycode::Escape => return None,
+
+                    // Reverses the full screen state
+                    Keycode::F11 => {
+                        let old_state = sdl_canvas.window().fullscreen_state();
+                        if sdl_canvas.window_mut().set_fullscreen(old_state == FullscreenType::Off).is_err() {
+                            return Some("Failed to set fullscreen mode!");
+                        }
+                    }
+
+                    // Handles chip8 key press
+                    _ => for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
                         if sdl_key == SDL3_CHIP8_KEY_MAP[chip8_key] {
                             chip8_context.keyboard[chip8_key] = true;
                         }
                     }
                 },
+
                 Event::KeyUp{keycode: Some(sdl_key), ..} => {
+                    // Handles chip8 key release
                     for chip8_key in 0..SDL3_CHIP8_KEY_MAP.len() {
                         if sdl_key == SDL3_CHIP8_KEY_MAP[chip8_key] {
                             chip8_context.keyboard[chip8_key] = false;
@@ -187,7 +244,8 @@ fn app_main() -> Option<&'static str> {
         }
 
         // let pixel_buffer_u8 = from_raw_parts_mut(pixel_buffer.as_mut_ptr().cast(), pixel_buffer.len() * 4);
-        if sdl_texture.update(None, chip8_context.frame_buffer.as_slice(), chip8::FRAME_BUFFER_WIDTH as usize * 4).is_err() {
+        let frame_buffer = chip8_context.frame_buffer.as_slice();
+        if sdl_texture.update(None, frame_buffer, chip8::FRAME_BUFFER_WIDTH as usize * 4).is_err() {
             return Some("Failed to update texture!")
         }
 
@@ -197,27 +255,25 @@ fn app_main() -> Option<&'static str> {
             return Some("Failed to copy texture!")
         };
 
-        // Times the frame and the presentation to the gpu
-        let present_time = Instant::now();
-        sdl_canvas.present();
-        let present_elapsed = present_time.elapsed();
-        let mut elapsed_time = start_time.elapsed().as_nanos() as i64;
-
         // Sets frame delta to the next vsync interval or sleeps remaining frame time
         frame_delta += match is_vsync {
             true => {
+                // Presents frame to gpu and gets frame time
+                sdl_canvas.present();
+
+                let elapsed_time = start_time.elapsed().as_nanos() as i64;
                 start_time = Instant::now();
 
                 // https://frankforce.com/frame-rate-delta-buffering/
                 frame_delta_buffer += elapsed_time;
                 let delta = match frame_delta_buffer / refresh_time_nanos {
-                    ..-1 => {
+                    ..0 => {
                         // Turns off vsync if updating more than one frame ahead
-                        if CONSOLE_MESSAGES && is_vsync { println!("Turning off vsync"); }
+                        if CONSOLE_MESSAGES { println!("Turning off vsync"); }
                         is_vsync = false;
                         elapsed_time
                     }
-                    -1 | 0 => refresh_time_nanos,
+                    0 => refresh_time_nanos,
                     frames => {
                         // Missed at least one frame
                         if CONSOLE_MESSAGES {
@@ -231,6 +287,11 @@ fn app_main() -> Option<&'static str> {
                 frame_delta_buffer -= delta;
                 delta
             } false => {
+                let mut elapsed_time = start_time.elapsed().as_nanos() as i64;
+                if CONSOLE_MESSAGES && elapsed_time > refresh_time_nanos {
+                    println!("Frame took an extra {} nanoseconds", elapsed_time - refresh_time_nanos);
+                }
+
                 // https://blog.bearcats.nl/perfect-sleep-function/
                 if elapsed_time < refresh_time_nanos {
                     // Sleeps to minimize spinlock
@@ -255,18 +316,12 @@ fn app_main() -> Option<&'static str> {
                     }
                 }
 
-                // Begins frame at the end of sleep
+                // Begins frame with presenting frame to the gpu at the end of sleep
                 start_time = Instant::now();
+                sdl_canvas.present();
                 elapsed_time
             }
         };
-
-        // Turns on vsync if a present call takes more than a frame
-        if !is_vsync && present_elapsed.as_nanos() as i64 > refresh_time_nanos {
-            if CONSOLE_MESSAGES { println!("Turning on vsync"); }
-            frame_delta_buffer = 0;
-            is_vsync = true;
-        }
 
         // Caps frame delta in case of very long (10 ms) delay
         if frame_delta > NANOS_IN_SECOND / 10 { frame_delta = NANOS_IN_SECOND / 10 }
@@ -307,7 +362,7 @@ impl AudioCallback<i16> for AudioState {
 
         // Copies audio samples from a buffer to the audio stream
         if stream.put_data_i16(&self.buffer).is_err() {
-            panic!("Failed to fill audio stream!")
+            println!("Failed to fill audio stream!")
         }
     }
 }

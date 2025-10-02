@@ -5,7 +5,15 @@ I wrote this demo to learn about the rust programming language and emulation. I 
 ### Command line syntax
 chip8-emulator \<Rom path\> \<Options\>\
 Options:
-* -c -clock \<The number of cycles per second\> (default: 500 hz)
+* -bg -background   \<RGB color\> | \<Red\> \<Green\> \<Blue\>  (default: 0, 0, 0)
+* -c  -clock        \<Cycles per second\>                       (default: 500 hz)
+* -fg -foreground   \<RGB color\> | \<Red\> \<Green\> \<Blue\>  (default: 255, 255, 255)
+* -fs -fullscreen   Turns on fullscreen mode
+* -h  -help         Displays this help message
+*     -nodrawsync   Turns off the 60hz draw sync
+*     -novsync      Turns off vertical sync
+* -sf -scalefactor  \<Scale factor of 64x32 screen\>
+* -w  -windowsize   \<Pixel width\> \<Pixel height\>
 
 ### Build
 This project is simply built with "cargo build --release".\

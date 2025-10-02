@@ -1,11 +1,10 @@
 // Namespace imports
-use std::env;
 use rand::{rngs::SmallRng, RngCore, SeedableRng};
+use crate::{config::Chip8Configuration};
+
 extern crate rand;
 
 // Constants
-pub const BACKGROUND_COLOR: u32 = 0xFF000000;
-const FOREGROUND_COLOR: u32 = 0xFFFFFFFF;
 const FLAGS_REGISTER: usize = 0xF;
 pub const FRAME_BUFFER_WIDTH: u16 = 64;
 pub const FRAME_BUFFER_HEIGHT: u16 = 32;
@@ -40,10 +39,14 @@ pub struct Chip8 {
     stack: Box<[u16; 12]>,
     pub key_released: Box<[bool; 16]>,
     pub keyboard: Box<[bool; 16]>,
+
     random_generator: SmallRng,
     pub remaining_samples: Option<i32>,
     clock_hz: u32,
     clock_buffer: u32,
+    pub background_color: u32,
+    foreground_color: u32,
+    is_drawsync: bool,
 
     program_counter: u16,
     index_register: u16,
@@ -54,65 +57,9 @@ pub struct Chip8 {
 }
 
 impl Chip8 {
-    pub fn init() -> Result<Chip8, &'static str> {
-        // Reads file path and clock speed from the command line
-        let mut rom_path = String::from("");
-        let mut clock_per_sec = None;
-
-        let mut args =  env::args().skip(1);
-        loop {
-            // Exits iterator at the end of the environment args
-            let arg = match args.next() {
-                Some(arg) => arg,
-                None => break
-            };
-
-            // Parses command parameters and the numerical postfix
-            let arg_type = arg.trim_end_matches(char::is_numeric);
-            match arg_type {
-                "-c" | "-clock" => {
-                    if let Some(_) = clock_per_sec {
-                        return Err("Clock speed is already set!")
-                    }
-
-                    // Reads clock speed argument with or without a space
-                    let value = match arg.len() == arg_type.len() {
-                        false => String::from(&arg[arg_type.len()..]),
-                        true => match args.next() {
-                            Some(arg) => arg,
-                            None => return Err("Clock speed is missing!")
-                        }
-                    };
-
-                    // Parses clock speed argument as a number
-                    match value.parse::<u32>() {
-                        Ok(arg) => clock_per_sec = Some(arg),
-                        Err(_) => return Err("Clock speed is not a number!")
-                    }
-                }
-
-                // Accepts at most one rom path
-                _ => match rom_path.as_str() {
-                    "" => rom_path = arg,
-                    _ => return Err("Rom path is already set!")
-                }
-            }
-        }
-
-        // Terminates without a rom path
-        if rom_path == "" {
-            return Err("Missing path to the rom!")
-        }
-
-        // Terminates when the clock is zero and sets default to 500
-        let clock_per_sec = match clock_per_sec {
-            None => 500, // Default clock hz
-            Some(0) => return Err("Clock speed must be greater than zero!"),
-            Some(hz) => hz
-        };
-
+    pub fn init(config: &Chip8Configuration) -> Result<Chip8, &'static str> {
         // Reads rom from file
-        let rom = match std::fs::read(rom_path) {
+        let rom = match std::fs::read(&config.rom_path) {
             Ok(file) => file,
             Err(_) => return Err("Path to the rom is invalid!")
         };
@@ -127,12 +74,12 @@ impl Chip8 {
         ram[0x200..0x200 + rom.len()].clone_from_slice(&rom);
 
         // Initializes non cryptographic random number generator
-        let rng = rand::rngs::SmallRng::from_os_rng();
+        let rng = SmallRng::from_os_rng();
 
         // Initializes registers and memory to zero, and program counter to 0x200
         Ok(Chip8 {ram, frame_buffer: Box::new([0; FRAME_BUFFER_SIZE]), stack: Box::new([0; 12]), key_released: Box::new([false; 16]), keyboard: Box::new([false; 16]),
-            random_generator: rng, remaining_samples: None, clock_hz: clock_per_sec, clock_buffer: 0, program_counter: 0x200, index_register: 0, stack_pointer: 0, 
-            delay_timer: 0, sound_timer: 0, general_registers: [0; 16]})
+            random_generator: rng, remaining_samples: None, background_color: config.background_color, foreground_color: config.foreground_color, is_drawsync: config.is_drawsync,
+            clock_hz: config.clock_hz, clock_buffer: 0, program_counter: 0x200, index_register: 0, stack_pointer: 0, delay_timer: 0, sound_timer: 0, general_registers: [0; 16]})
     }
 
     pub fn run(&mut self) -> Option<&'static str> {
@@ -165,7 +112,7 @@ impl Chip8 {
                 0x0 => match nnn {
                     // opcode CLS - clears the display
                     0x0E0 => for pixel in self.frame_buffer.chunks_exact_mut(4) {
-                        pixel.copy_from_slice(&BACKGROUND_COLOR.to_le_bytes());
+                        pixel.copy_from_slice(&self.background_color.to_le_bytes());
                     }
 
                     // opcode RET - returns from subroutine
@@ -330,20 +277,22 @@ impl Chip8 {
                             // Sets the flags register to 1 if another sprite is erased
                             let pixel_index = row_index + (x + j) as u16;
                             let pixel = &mut self.frame_buffer[pixel_index as usize * 4..(pixel_index as usize + 1) * 4];
-                            match (pixel == FOREGROUND_COLOR.to_le_bytes(), is_pixel_set) {
-                                (false, 0) => pixel.copy_from_slice(&BACKGROUND_COLOR.to_le_bytes()),
-                                (false, _) | (true, 0) => pixel.copy_from_slice(&FOREGROUND_COLOR.to_le_bytes()),
+                            match (pixel == self.foreground_color.to_le_bytes(), is_pixel_set) {
+                                (false, 0) => pixel.copy_from_slice(&self.background_color.to_le_bytes()),
+                                (false, _) | (true, 0) => pixel.copy_from_slice(&self.foreground_color.to_le_bytes()),
                                 (true, _) => {
                                     self.general_registers[FLAGS_REGISTER] = 1;
-                                    pixel.copy_from_slice(&BACKGROUND_COLOR.to_le_bytes());
+                                    pixel.copy_from_slice(&self.background_color.to_le_bytes());
                                 }
                             }
                         }
                     }
 
                     // Waits until next vertical blank
-                    self.program_counter += 2;
-                    break 'run_loop
+                    if self.is_drawsync {
+                        self.program_counter += 2;
+                        break 'run_loop
+                    }
                 },
 
                 0xE => match opcode[1] {
@@ -389,8 +338,9 @@ impl Chip8 {
 
                         if self.sound_timer > 1 {
                             // Calculates the number of audio samples in the sound timer's duration
-                            let elapsed_frame_samples = (cycle as f32 / cycles as f32 * (48000.0 / 60.0)) as i32;
-                            self.remaining_samples = Some(self.sound_timer as i32 * 48000 / 60 - elapsed_frame_samples);
+                            let cycles_before_timer = cycles * 60 + self.clock_buffer - self.clock_hz;
+                            let elapsed_frame_samples = ((cycle + 1) * 60 - cycles_before_timer) as f32 * (48000.0 / 60.0 / self.clock_hz as f32);
+                            self.remaining_samples = Some(self.sound_timer as i32 * (48000 / 60) - elapsed_frame_samples as i32);
                         }
                     },
 
