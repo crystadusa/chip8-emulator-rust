@@ -1,10 +1,12 @@
 // Namespace imports
 use rand::{rngs::SmallRng, RngCore, SeedableRng};
+use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
 use crate::{config::Chip8Configuration};
 
 extern crate rand;
 
 // Constants
+const CLOCK_DELTA: f32 = 1000000000.0 / 60.0;
 const FLAGS_REGISTER: usize = 0xF;
 pub const FRAME_BUFFER_WIDTH: u16 = 64;
 pub const FRAME_BUFFER_HEIGHT: u16 = 32;
@@ -41,9 +43,10 @@ pub struct Chip8 {
     pub keyboard: Box<[bool; 16]>,
 
     random_generator: SmallRng,
-    pub remaining_samples: Option<i32>,
-    clock_hz: u32,
-    clock_buffer: u32,
+    pub remaining_samples: Arc<AtomicI32>,
+    cycle_hz: u32,
+    cycle_buffer: f32,
+    clock_buffer: f32,
     pub background_color: u32,
     foreground_color: u32,
     is_drawsync: bool,
@@ -78,27 +81,31 @@ impl Chip8 {
 
         // Initializes registers and memory to zero, and program counter to 0x200
         Ok(Chip8 {ram, frame_buffer: Box::new([0; FRAME_BUFFER_SIZE]), stack: Box::new([0; 12]), key_released: Box::new([false; 16]), keyboard: Box::new([false; 16]),
-            random_generator: rng, remaining_samples: None, background_color: config.background_color, foreground_color: config.foreground_color, is_drawsync: config.is_drawsync,
-            clock_hz: config.clock_hz, clock_buffer: 0, program_counter: 0x200, index_register: 0, stack_pointer: 0, delay_timer: 0, sound_timer: 0, general_registers: [0; 16]})
+            random_generator: rng, remaining_samples: Arc::new(AtomicI32::new(0)), background_color: config.background_color, foreground_color: config.foreground_color,
+            is_drawsync: config.is_drawsync, cycle_hz: config.clock_hz, cycle_buffer: 0.0, clock_buffer: 0.0,
+            program_counter: 0x200, index_register: 0, stack_pointer: 0, delay_timer: 0, sound_timer: 0, general_registers: [0; 16]})
     }
 
-    pub fn run(&mut self) -> Option<&'static str> {
-        // Decrements timers at the start of frame
-        if self.delay_timer > 0 { self.delay_timer -= 1; }
-        if self.sound_timer > 0 { self.sound_timer -= 1; }
-
-        // Subtracts 1/60th of a second increments from 1/clock_hz second increments to calculate cycles in a frame
-        // A buffer transfers the time not emulated to the next frame
-        self.clock_buffer += self.clock_hz;
-        let cycles = self.clock_buffer / 60;
-        self.clock_buffer %= 60;
-
-        // Runs self.clock_hz instructions a second at 60 fps
-        'run_loop: for cycle in 0..cycles {
+    pub fn run(&mut self, delta: f32) -> Option<&'static str> {
+        // Runs cycle_hz instructions a second and 60 ticks per second
+        self.cycle_buffer += delta;
+        let cycle_delta = 1000000000.0 / self.cycle_hz as f32;
+        'run_loop: while self.cycle_buffer >= cycle_delta {
             // Terminates if the program counter is out of range or unaligned
             if self.program_counter < 0x200 || self.program_counter >= MAX_RAM_ADDRESS || self.program_counter % 2 == 1{
                 return Some("Invalid program counter address!")
             }
+
+            // https://www.gafferongames.com/post/fix_your_timestep/
+            while self.clock_buffer >= CLOCK_DELTA {
+                // Decrements timers at the end of a cycke
+                self.clock_buffer -= CLOCK_DELTA;
+                if self.delay_timer > 0 { self.delay_timer -= 1; }
+                if self.sound_timer > 0 { self.sound_timer -= 1; }
+            }
+
+            self.cycle_buffer -= cycle_delta;
+            self.clock_buffer += cycle_delta;
 
             // Parses opcode for its values
             let opcode = &self.ram[self.program_counter as usize..self.program_counter as usize + 2];
@@ -290,8 +297,10 @@ impl Chip8 {
 
                     // Waits until next vertical blank
                     if self.is_drawsync {
-                        self.program_counter += 2;
-                        break 'run_loop
+                        while self.clock_buffer < CLOCK_DELTA {
+                            self.clock_buffer += cycle_delta;
+                            self.cycle_buffer -= cycle_delta;
+                        }
                     }
                 },
 
@@ -325,7 +334,19 @@ impl Chip8 {
                         }
 
                         // Waits if no key is pressed
-                        if !is_key_pressed { break 'run_loop }
+                        if !is_key_pressed {
+                            while self.cycle_buffer >= cycle_delta {
+                                self.clock_buffer += cycle_delta;
+                                self.cycle_buffer -= cycle_delta;
+                            }
+
+                            while self.clock_buffer > CLOCK_DELTA {
+                                self.clock_buffer -= CLOCK_DELTA;
+                                if self.delay_timer > 0 { self.delay_timer -= 1; }
+                                if self.sound_timer > 0 { self.sound_timer -= 1; }
+                            }
+                            break 'run_loop
+                        }
                     }
 
                     // opcode LD DT, VX - register x is loaded in the delay timer
@@ -335,12 +356,11 @@ impl Chip8 {
                     // a value of 1 is not responded to on original hardware
                     0x18 => {
                         self.sound_timer = self.general_registers[x as usize];
-
                         if self.sound_timer > 1 {
                             // Calculates the number of audio samples in the sound timer's duration
-                            let cycles_before_timer = cycles * 60 + self.clock_buffer - self.clock_hz;
-                            let elapsed_frame_samples = ((cycle + 1) * 60 - cycles_before_timer) as f32 * (48000.0 / 60.0 / self.clock_hz as f32);
-                            self.remaining_samples = Some(self.sound_timer as i32 * (48000 / 60) - elapsed_frame_samples as i32);
+                            let elapsed_frame_samples = self.clock_buffer % CLOCK_DELTA * (48000.0 / 1000000000.0);
+                            let remaining_samples = self.sound_timer as i32 * (48000 / 60) - elapsed_frame_samples as i32;
+                            self.remaining_samples.store(remaining_samples, Ordering::Release);
                         }
                     },
 

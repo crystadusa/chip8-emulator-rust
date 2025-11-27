@@ -22,7 +22,7 @@ const SDL3_CHIP8_KEY_MAP: [Keycode; 16] = [
     Keycode::S, Keycode::D, Keycode::Z, Keycode::C, Keycode::_4, Keycode::R, Keycode::F, Keycode::V,
 ];
     
-const NANOS_IN_SECOND: i64 = 1000000000;
+const NANOS_IN_SECOND: u64 = 1000000000;
 const CONSOLE_MESSAGES: bool = false;
 
 // Allows convenient error handling by returning a message
@@ -128,10 +128,9 @@ fn app_main() -> Option<&'static str> {
 
     // Initializes audio stream with callback
     let audio_spec = AudioSpec{freq: Some(48000), channels: Some(1), format: Some(AudioFormat::s16_sys())};
-    let remaining_samples = Arc::new(AtomicI32::new(0));
     let sdl_audio_stream = match sdl_audio_subsystem.default_playback_device()
     .open_playback_stream_with_callback(&audio_spec, AudioState{buffer: Vec::new(), phase: 0, previous: 0,
-        remaining_samples: remaining_samples.clone()}) {
+        remaining_samples: chip8_context.remaining_samples.clone()}) {
         Ok(stream) => stream,
         Err(_) => return Some("Failed to initialize audio stream!")
     };
@@ -161,7 +160,10 @@ fn app_main() -> Option<&'static str> {
     let mut start_time = Instant::now();
     let mut frame_delta = 0;
     let mut frame_delta_buffer = 0;
-    
+
+    let mut average_total = 0;
+    let mut average_count = 0;
+
     loop {
         // Event loop
         for event in sdl_event_pump.poll_iter() {
@@ -226,20 +228,20 @@ fn app_main() -> Option<&'static str> {
             }
         }
 
-        // https://www.gafferongames.com/post/fix_your_timestep/
-        const UPDATE_DELTA: i64 = NANOS_IN_SECOND / 60;
-        while frame_delta > UPDATE_DELTA {
-            frame_delta -= UPDATE_DELTA;
+        // Emulates chip8 for the frame time
+        let emulation_start = std::time::Instant::now();
+        if let Some(message) = chip8_context.run(frame_delta as f32) {
+            return Some(message)
+        }
 
-            // Emulates chip8 for 1/60th of a second
-            if let Some(message) = chip8_context.run() {
-                return Some(message)
-            }
-
-            // Sets the remaining samples when the sound timer changes
-            if let Some(samples) = chip8_context.remaining_samples {
-                remaining_samples.store(samples, Ordering::Release);
-                chip8_context.remaining_samples = None;
+        // Displays the average emulation time every 1024 frames
+        if CONSOLE_MESSAGES {
+            average_total += emulation_start.elapsed().as_nanos();
+            average_count += 1;
+            if average_count >= 1024 {
+                println!("Average emulation frame is {}", average_total / average_count as u128);
+                average_total = 0;
+                average_count = 0;
             }
         }
 
@@ -256,39 +258,39 @@ fn app_main() -> Option<&'static str> {
         };
 
         // Sets frame delta to the next vsync interval or sleeps remaining frame time
-        frame_delta += match is_vsync {
+        frame_delta = match is_vsync {
             true => {
                 // Presents frame to gpu and gets frame time
                 sdl_canvas.present();
 
-                let elapsed_time = start_time.elapsed().as_nanos() as i64;
+                let elapsed_time = start_time.elapsed().as_nanos() as u64;
                 start_time = Instant::now();
 
                 // https://frankforce.com/frame-rate-delta-buffering/
-                frame_delta_buffer += elapsed_time;
-                let delta = match frame_delta_buffer / refresh_time_nanos {
-                    ..0 => {
+                frame_delta_buffer += elapsed_time as i64;
+                let delta = match frame_delta_buffer / refresh_time_nanos as i64 {
+                    ..-1 => {
                         // Turns off vsync if updating more than one frame ahead
                         if CONSOLE_MESSAGES { println!("Turning off vsync"); }
                         is_vsync = false;
                         elapsed_time
                     }
-                    0 => refresh_time_nanos,
+                    -1 | 0 => refresh_time_nanos,
                     frames => {
                         // Missed at least one frame
                         if CONSOLE_MESSAGES {
                             let missed_frame_count = frame_delta_buffer as f32 / refresh_time_nanos as f32;
                             println!("Missed a vsync by {} frames", missed_frame_count - 1.0);
                         }
-                        (frames + 1) * refresh_time_nanos
+                        (frames as u64 + 1) * refresh_time_nanos
                     }
                 };
 
-                frame_delta_buffer -= delta;
+                frame_delta_buffer -= delta as i64;
                 delta
             } false => {
-                let mut elapsed_time = start_time.elapsed().as_nanos() as i64;
-                if CONSOLE_MESSAGES && elapsed_time > refresh_time_nanos {
+                let mut elapsed_time = start_time.elapsed().as_nanos() as u64;
+                if CONSOLE_MESSAGES && elapsed_time >= refresh_time_nanos {
                     println!("Frame took an extra {} nanoseconds", elapsed_time - refresh_time_nanos);
                 }
 
@@ -297,7 +299,7 @@ fn app_main() -> Option<&'static str> {
                     // Sleeps to minimize spinlock
                     const SLEEP_PERIOD: u64 = 1020000;
                     let mut sleep_time = (refresh_time_nanos - elapsed_time) as u64;
-                    if sleep_time > SLEEP_PERIOD {
+                    if sleep_time >= SLEEP_PERIOD {
                         // Subtracts 1.02 ms because of sleep inaccuracy
                         sleep_time -= SLEEP_PERIOD;
                         sleep(Duration::from_nanos(sleep_time));
@@ -305,13 +307,13 @@ fn app_main() -> Option<&'static str> {
 
                     // Spin-locks the rest remaining period
                     loop {
-                        elapsed_time = start_time.elapsed().as_nanos() as i64;
+                        elapsed_time = start_time.elapsed().as_nanos() as u64;
                         if elapsed_time >= refresh_time_nanos { break }
                         yield_now();
                     }
 
                     // Debug message when an extra 200 microseconds is slept
-                    if CONSOLE_MESSAGES && elapsed_time > refresh_time_nanos + 200000 {
+                    if CONSOLE_MESSAGES && elapsed_time >= refresh_time_nanos + 200000 {
                         println!("Slept for an extra {} nanoseconds", elapsed_time - refresh_time_nanos);
                     }
                 }
@@ -368,7 +370,7 @@ impl AudioCallback<i16> for AudioState {
 }
 
 // Returns frame time of a sdl display in nanoseconds
-fn sdl3_get_refresh_time(display: Display) -> Option<i64> {
+fn sdl3_get_refresh_time(display: Display) -> Option<u64> {
     let display_mode = match display.get_mode() {
         Ok(mode) => mode,
         Err(_) => {
@@ -376,5 +378,5 @@ fn sdl3_get_refresh_time(display: Display) -> Option<i64> {
             return None
         }
     };
-    Some((NANOS_IN_SECOND as f32 / display_mode.refresh_rate) as i64)
+    Some((NANOS_IN_SECOND as f32 / display_mode.refresh_rate) as u64)
 }
