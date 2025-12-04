@@ -10,9 +10,9 @@ Options:
 * -fg -foreground    \<RGB color\> | \<Red\> \<Green\> \<Blue\>  (default: 255, 255, 255)
 * -fs -fullscreen    Turns on fullscreen mode
 * -h  -help          Displays this help message
-*     -nodrawsync    Turns off the 60hz draw sync
-*     -novsync       Turns off vertical sync
-*     -noyregshift   Shifts from the x register
+* -nodrawsync        Turns off the 60hz draw sync
+* -novsync           Turns off vertical sync
+* -noyregshift       Shifts from the x register
 * -sf -scalefactor   \<Scale factor of 64x32 screen\>
 * -w  -windowsize    \<Pixel width\> \<Pixel height\>
 
@@ -27,3 +27,4 @@ Remember to set a corresponding cmake generator on windows with a developer shel
 * test roms: https://github.com/Timendus/chip8-test-suite?tab=readme-ov-file
 * variant opcode table: https://chip8.gulrak.net/
 * other resources: https://chip-8.github.io/links/
+
