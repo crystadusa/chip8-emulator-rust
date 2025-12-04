@@ -1,5 +1,5 @@
 // Namespace imports
-use std::{sync::{atomic::{AtomicI32, Ordering}, Arc}, thread::{sleep, yield_now}, time::{Duration, Instant}};
+use std::{slice::from_raw_parts, sync::{Arc, atomic::{AtomicI32, Ordering}}, thread::{sleep, yield_now}, time::{Duration, Instant}};
 
 use sdl3::{
     audio::{AudioCallback, AudioFormat, AudioSpec, AudioStream},
@@ -245,9 +245,9 @@ fn app_main() -> Option<&'static str> {
             }
         }
 
-        // let pixel_buffer_u8 = from_raw_parts_mut(pixel_buffer.as_mut_ptr().cast(), pixel_buffer.len() * 4);
         let frame_buffer = chip8_context.frame_buffer.as_slice();
-        if sdl_texture.update(None, frame_buffer, chip8::FRAME_BUFFER_WIDTH as usize * 4).is_err() {
+        let pixel_data= unsafe { from_raw_parts(frame_buffer.as_ptr().cast(), chip8::FRAME_BUFFER_SIZE * 4) };
+        if sdl_texture.update(None, pixel_data, chip8::FRAME_BUFFER_WIDTH as usize * 4).is_err() {
             return Some("Failed to update texture!")
         }
 

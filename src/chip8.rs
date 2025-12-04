@@ -10,7 +10,7 @@ const CLOCK_DELTA: f32 = 1000000000.0 / 60.0;
 const FLAGS_REGISTER: usize = 0xF;
 pub const FRAME_BUFFER_WIDTH: u16 = 64;
 pub const FRAME_BUFFER_HEIGHT: u16 = 32;
-const FRAME_BUFFER_SIZE: usize = FRAME_BUFFER_WIDTH as usize * FRAME_BUFFER_HEIGHT as usize * 4;
+pub const FRAME_BUFFER_SIZE: usize = FRAME_BUFFER_WIDTH as usize * FRAME_BUFFER_HEIGHT as usize;
 const MAX_RAM_ADDRESS: u16 = 0x1000 - 0x160; // Last 0x160 bytes are reserved
 const SPRITE_WIDTH: u8 = 8;
 
@@ -36,27 +36,29 @@ const FONTS: [u8; 0x50] = [
 
 // The chip8 state which can be initialized and ran
 pub struct Chip8 {
-    ram: Box<[u8; MAX_RAM_ADDRESS as usize]>,
-    pub frame_buffer: Box<[u8; FRAME_BUFFER_SIZE]>,
-    stack: Box<[u16; 12]>,
-    pub key_released: Box<[bool; 16]>,
-    pub keyboard: Box<[bool; 16]>,
+    ram: [u8; MAX_RAM_ADDRESS as usize],
+    pub frame_buffer: [u32; FRAME_BUFFER_SIZE],
+    stack: [u16; 12],
+    pub keyboard: [bool; 16],
+    pub key_released: [bool; 16],
 
-    random_generator: SmallRng,
-    pub remaining_samples: Arc<AtomicI32>,
-    cycle_hz: u32,
-    cycle_buffer: f32,
-    clock_buffer: f32,
-    pub background_color: u32,
-    foreground_color: u32,
-    is_drawsync: bool,
-
+    general_registers: [u8; 16],
     program_counter: u16,
     index_register: u16,
     stack_pointer: u8,
+
     delay_timer: u8,
-    pub sound_timer: u8,
-    general_registers: [u8; 16]
+    pub remaining_samples: Arc<AtomicI32>,
+
+    cycle_hz: u32,
+    cycle_buffer: f32,
+    clock_buffer: f32,
+
+    pub background_color: u32,
+    foreground_color: u32,
+    is_drawsync: bool,
+    is_shift_quirk: bool,
+    random_generator: SmallRng,
 }
 
 impl Chip8 {
@@ -72,7 +74,7 @@ impl Chip8 {
             return Err("The rom is too large for the ram!")
         }
 
-        let mut ram = Box::new([0; MAX_RAM_ADDRESS as usize]);
+        let mut ram = [0; MAX_RAM_ADDRESS as usize];
         ram[..FONTS.len()].clone_from_slice(&FONTS);
         ram[0x200..0x200 + rom.len()].clone_from_slice(&rom);
 
@@ -80,28 +82,28 @@ impl Chip8 {
         let rng = SmallRng::from_os_rng();
 
         // Initializes registers and memory to zero, and program counter to 0x200
-        Ok(Chip8 {ram, frame_buffer: Box::new([0; FRAME_BUFFER_SIZE]), stack: Box::new([0; 12]), key_released: Box::new([false; 16]), keyboard: Box::new([false; 16]),
-            random_generator: rng, remaining_samples: Arc::new(AtomicI32::new(0)), background_color: config.background_color, foreground_color: config.foreground_color,
-            is_drawsync: config.is_drawsync, cycle_hz: config.clock_hz, cycle_buffer: 0.0, clock_buffer: 0.0,
-            program_counter: 0x200, index_register: 0, stack_pointer: 0, delay_timer: 0, sound_timer: 0, general_registers: [0; 16]})
+        Ok(Chip8 {ram, frame_buffer: [0; FRAME_BUFFER_SIZE], stack: [0; 12], keyboard: [false; 16], key_released: [false; 16],
+            general_registers: [0; 16], program_counter: 0x200, index_register: 0, stack_pointer: 0, delay_timer: 0,
+            remaining_samples: Arc::new(AtomicI32::new(0)), cycle_hz: config.clock_hz, cycle_buffer: 0.0, clock_buffer: 0.0,
+            background_color: config.background_color, foreground_color: config.foreground_color, is_drawsync: config.is_drawsync,
+            is_shift_quirk: config.is_shift_quirk, random_generator: rng})
     }
 
     pub fn run(&mut self, delta: f32) -> Option<&'static str> {
         // Runs cycle_hz instructions a second and 60 ticks per second
         self.cycle_buffer += delta;
         let cycle_delta = 1000000000.0 / self.cycle_hz as f32;
-        'run_loop: while self.cycle_buffer >= cycle_delta {
+        'cycle_loop: while self.cycle_buffer >= cycle_delta {
             // Terminates if the program counter is out of range or unaligned
-            if self.program_counter < 0x200 || self.program_counter >= MAX_RAM_ADDRESS || self.program_counter % 2 == 1{
+            if self.program_counter < 0x200 || self.program_counter >= MAX_RAM_ADDRESS - 1 {
                 return Some("Invalid program counter address!")
             }
 
             // https://www.gafferongames.com/post/fix_your_timestep/
             while self.clock_buffer >= CLOCK_DELTA {
-                // Decrements timers at the end of a cycke
+                // Decrements timers at the end of a cycle
                 self.clock_buffer -= CLOCK_DELTA;
                 if self.delay_timer > 0 { self.delay_timer -= 1; }
-                if self.sound_timer > 0 { self.sound_timer -= 1; }
             }
 
             self.cycle_buffer -= cycle_delta;
@@ -112,14 +114,18 @@ impl Chip8 {
             let (op0, op1, op2, op3) = (opcode[0] >> 4, opcode[0] & 0xF, opcode[1] >> 4, opcode[1] & 0xF);
             let (x, y, n) = (op1, op2, op3);
             let kk = opcode[1];
-            let nnn = ((op1 as u16) << 8) | opcode[1] as u16;
+            let nnn = u16::from_be_bytes([opcode[0], opcode[1]]) & 0xFFF;
 
             // Parses rom instructions
             match op0 {
                 0x0 => match nnn {
                     // opcode CLS - clears the display
-                    0x0E0 => for pixel in self.frame_buffer.chunks_exact_mut(4) {
-                        pixel.copy_from_slice(&self.background_color.to_le_bytes());
+                    0x0E0 => {
+                        for pixel in self.frame_buffer.iter_mut() {
+                            *pixel = self.background_color;
+                        }
+
+                        self.program_counter += 2;
                     }
 
                     // opcode RET - returns from subroutine
@@ -132,61 +138,83 @@ impl Chip8 {
                     },
                     
                     // opcode SYS addr - jumps to machine code runtime (ignored by modern interpreters)
-                    _ => ()
+                    _ => self.program_counter += 2,
                 }
 
                 // opcode JP addr - jumps to address nnn
-                0x1 => self.program_counter = nnn - 2,
+                0x1 => self.program_counter = nnn,
 
                 // opcode CALL Vx, byte - calls subroutine at nnn
                 0x2 => {
-                    if self.stack_pointer as usize == self.stack.len() {
+                    if self.stack_pointer as usize >= self.stack.len() {
                         return Some("Stack overflow on function call!")
                     }
-                    self.stack[self.stack_pointer as usize] = self.program_counter;
+                    self.stack[self.stack_pointer as usize] = self.program_counter + 2;
                     self.stack_pointer += 1;
-                    self.program_counter = nnn - 2;
+                    self.program_counter = nnn;
                 },
 
                 // opcode SE Vx, byte - skips instruction if register x == kk
-                0x3 => if self.general_registers[x as usize] == kk { self.program_counter += 2; },
+                0x3 => {
+                    if self.general_registers[x as usize] == kk { self.program_counter += 4; }
+                    else { self.program_counter += 2; }
+                }
 
                 // opcode SNE Vx, byte - skips instruction if register x != kk
-                0x4 => if self.general_registers[x as usize] != kk { self.program_counter += 2; },
+                0x4 => {
+                    if self.general_registers[x as usize] != kk { self.program_counter += 4; }
+                    else { self.program_counter += 2; }
+                }
 
                 0x5 => match op3 {
                     // opcode SE Vx, Vy - skips instruction if register x == register y
-                    0x0 => if self.general_registers[x as usize] == self.general_registers[y as usize] { self.program_counter += 2; },
+                    0x0 =>{
+                        if self.general_registers[x as usize] == self.general_registers[y as usize] {
+                            self.program_counter += 4;
+                        } else { self.program_counter += 2; }
+                    }
                     _ => return Some("Unsupported opcode!")
                 },
 
                 // opcode LD Vx, byte - kk is loaded in register x
-                0x6 => self.general_registers[x as usize] = kk,
+                0x6 => {
+                    self.general_registers[x as usize] = kk;
+                    self.program_counter += 2;
+                }
 
                 // opcode ADD Vx, byte - register x plus kk is loaded in register x
-                0x7 => self.general_registers[x as usize] = self.general_registers[x as usize].wrapping_add(kk),
+                0x7 => {
+                    self.general_registers[x as usize] = self.general_registers[x as usize].wrapping_add(kk);
+                    self.program_counter += 2;
+                }
 
                 0x8 => match op3 {
                     // opcode LD Vx, Vy - registered y is loaded in register x
-                    0x0 => self.general_registers[x as usize] = self.general_registers[y as usize],
+                    0x0 => {
+                        self.general_registers[x as usize] = self.general_registers[y as usize];
+                        self.program_counter += 2;
+                    }
 
                     // the following opcodes reset the flags register to 0 
                     // opcode OR Vx, Vy - register x = register x | register y
                     0x1 => {
                         self.general_registers[x as usize] |= self.general_registers[y as usize];
                         self.general_registers[FLAGS_REGISTER] = 0;
+                        self.program_counter += 2;
                     }
 
                     // opcode AND Vx, Vy - register x = register x & register y
                     0x2 => {
                         self.general_registers[x as usize] &= self.general_registers[y as usize];
                         self.general_registers[FLAGS_REGISTER] = 0;
+                        self.program_counter += 2;
                     }
 
                     // opcode XOR Vx, Vy - register x = register x ^ register y
                     0x3 => {
                         self.general_registers[x as usize] ^= self.general_registers[y as usize];
                         self.general_registers[FLAGS_REGISTER] = 0;
+                        self.program_counter += 2;
                     }
 
                     // opcode AND Vx, Vy - register x = register x + register y
@@ -195,6 +223,7 @@ impl Chip8 {
                         let (result, overflow) = self.general_registers[x as usize].overflowing_add(self.general_registers[y as usize]);
                         self.general_registers[x as usize] = result;
                         self.general_registers[FLAGS_REGISTER] = overflow as u8;
+                        self.program_counter += 2;
                     },
 
                     // opcode SUB Vx, Vy - register x = register x - register y
@@ -203,14 +232,21 @@ impl Chip8 {
                         let (result, overflow) = self.general_registers[x as usize].overflowing_sub(self.general_registers[y as usize]);
                         self.general_registers[x as usize] = result;
                         self.general_registers[FLAGS_REGISTER] = !overflow as u8;
+                        self.program_counter += 2;
                     },
 
                     // opcode SHR Vx, Vy - register x is shifted to the right by one
                     // sets the flags register to 1 when shifting out a 1 bit
                     0x6 => {
-                        let value = self.general_registers[y as usize];
+                        // Some programs expect the shift instructions to operate from the x register
+                        let value = match self.is_shift_quirk {
+                            true => self.general_registers[y as usize],
+                            false => self.general_registers[x as usize]
+                        };
+
                         self.general_registers[x as usize] = value >> 1;
                         self.general_registers[FLAGS_REGISTER] = value & 1;
+                        self.program_counter += 2;
                     },
 
                     // opcode SUBN Vx, Vy - register x = register y - register x
@@ -219,32 +255,49 @@ impl Chip8 {
                         let (result, overflow) = self.general_registers[y as usize].overflowing_sub(self.general_registers[x as usize]);
                         self.general_registers[x as usize] = result;
                         self.general_registers[FLAGS_REGISTER] = !overflow as u8;
+                        self.program_counter += 2;
                     },
 
                     // opcode SHL Vx, Vy - register x is shifted to the left by one
                     // sets the flags register to 1 when shifting out a 1 bit
                     0xE => {
-                        let value = self.general_registers[y as usize];
+                        // Some programs expect the shift instructions to operate from the x register
+                        let value = match self.is_shift_quirk {
+                            true => self.general_registers[y as usize],
+                            false => self.general_registers[x as usize]
+                        };
+
                         self.general_registers[x as usize] = value << 1;
                         self.general_registers[FLAGS_REGISTER] = value >> 7;
+                        self.program_counter += 2;
                     },
                     _ => return Some("Unsupported opcode!")
                 }
 
                 0x9 => match op3 {
                     // opcode SNE Vx, Vy - skips instruction if register x != register y
-                    0x0 => if self.general_registers[x as usize] != self.general_registers[y as usize] { self.program_counter += 2; },
+                    0x0 => {
+                        if self.general_registers[x as usize] != self.general_registers[y as usize] {
+                            self.program_counter += 4;
+                        } else { self.program_counter += 2; }
+                    }
                     _ => return Some("Unsupported opcode!")
                 }
 
                 // opcode LD I, addr - nnn is loaded in the index register
-                0xA => self.index_register = nnn,
+                0xA => {
+                    self.index_register = nnn;
+                    self.program_counter += 2;
+                }
 
                 // opcode JP V0, addr - jumps to address nnn + register 0
-                0xB => self.program_counter = nnn + self.general_registers[0] as u16 - 2,
+                0xB => self.program_counter = nnn + self.general_registers[0] as u16,
 
                 // opcode RND Vx, byte - register x = random byte & register x
-                0xC => self.general_registers[x as usize] = self.random_generator.next_u64() as u8 & kk,
+                0xC => {
+                    self.general_registers[x as usize] = self.random_generator.next_u64() as u8 & kk;
+                    self.program_counter += 2;
+                }
 
                 // opcode DRW Vx, Vy, n - draws n byte sized sprite at the index register
                 // the x position is in the x register and the y position is in the y register
@@ -261,7 +314,7 @@ impl Chip8 {
                     let y = self.general_registers[y as usize] % FRAME_BUFFER_HEIGHT as u8;
 
                     // Terminates if the draw is accessing invalid ram
-                    if self.index_register + n as u16 - 1 >= MAX_RAM_ADDRESS {
+                    if self.index_register + n as u16 > MAX_RAM_ADDRESS {
                         return Some("Invalid memory access in draw!")
                     }
 
@@ -271,55 +324,67 @@ impl Chip8 {
                         if y + i >= FRAME_BUFFER_HEIGHT as u8 { break }
 
                         // Iterates the 8 columns of the sprite
-                        let row_data = self.ram[self.index_register as usize + i as usize];
+                        let mut row_data = self.ram[self.index_register as usize + i as usize];
                         let row_index = (y + i) as u16 * FRAME_BUFFER_WIDTH;
                         for j in 0..SPRITE_WIDTH {
                             // Caps x at the screen width for horizontal screen clipping
                             if x + j >= FRAME_BUFFER_WIDTH as u8 { break }
 
                             // The row data is a bit field for the pixel data
-                            let is_pixel_set = (row_data >> (SPRITE_WIDTH - 1 - j)) & 1;
+                            let is_pixel_set = row_data & 0x80;
+                            row_data <<= 1;
 
                             // Xor's the sprite with the frame buffer to draw
                             // Sets the flags register to 1 if another sprite is erased
                             let pixel_index = row_index + (x + j) as u16;
-                            let pixel = &mut self.frame_buffer[pixel_index as usize * 4..(pixel_index as usize + 1) * 4];
-                            match (pixel == self.foreground_color.to_le_bytes(), is_pixel_set) {
-                                (false, 0) => pixel.copy_from_slice(&self.background_color.to_le_bytes()),
-                                (false, _) | (true, 0) => pixel.copy_from_slice(&self.foreground_color.to_le_bytes()),
-                                (true, _) => {
+                            let pixel = &mut self.frame_buffer[pixel_index as usize];
+
+                            if is_pixel_set != 0 { match *pixel == self.foreground_color {
+                                false => *pixel = self.foreground_color,
+                                true => {
                                     self.general_registers[FLAGS_REGISTER] = 1;
-                                    pixel.copy_from_slice(&self.background_color.to_le_bytes());
+                                    *pixel = self.background_color;
                                 }
-                            }
+                            }}
                         }
                     }
 
                     // Waits until next vertical blank
                     if self.is_drawsync {
-                        while self.clock_buffer < CLOCK_DELTA {
-                            self.clock_buffer += cycle_delta;
-                            self.cycle_buffer -= cycle_delta;
-                        }
+                        let old_buffer = self.clock_buffer;
+                        self.clock_buffer = CLOCK_DELTA + old_buffer % cycle_delta;
+                        self.cycle_buffer -= self.clock_buffer - old_buffer;
                     }
+
+                    self.program_counter += 2;
                 },
 
-                0xE => match opcode[1] {
+                0xE => match kk {
                     // opcode SKP Vx - skips instruction if the key value in register x is pressed
-                    0x9E => if self.keyboard[self.general_registers[x as usize] as usize & 0xF] { self.program_counter += 2; },
+                    0x9E => {
+                        if self.keyboard[self.general_registers[x as usize] as usize & 0xF] {
+                            self.program_counter += 4;
+                        } else { self.program_counter += 2; }
+                    }
                     
                     // opcode SKP Vx - skips instruction if the key value in register x is not pressed
-                    0xA1 => if !self.keyboard[self.general_registers[x as usize] as usize & 0xF] { self.program_counter += 2; },
+                    0xA1 => {
+                        if !self.keyboard[self.general_registers[x as usize] as usize & 0xF] {
+                            self.program_counter += 4;
+                        } else { self.program_counter += 2; }
+                    }
                     _ => return Some("Unsupported opcode!")
                 }
 
-                0xF => match opcode[1] {
+                0xF => match kk {
                     // opcode LD Vx, DT - the delay timer is loaded in register x
-                    0x07 => self.general_registers[x as usize] = self.delay_timer,
+                    0x07 => {
+                        self.general_registers[x as usize] = self.delay_timer;
+                        self.program_counter += 2;
+                    }
                     
                     // opcode LD Vx, K - waits for a key press, then the key is loaded in register x
                     0x0A => {
-                        let mut is_key_pressed = false;
                         for i in 0..self.keyboard.len() {
                             // Iterates to find a released key
                             if self.key_released[i] {
@@ -328,48 +393,56 @@ impl Chip8 {
 
                                 // Returns the released key in register x
                                 self.general_registers[x as usize] = i as u8;
-                                is_key_pressed = true;
-                                break
+
+                                // Stops waiting if a key is released
+                                self.program_counter += 2;
+                                continue 'cycle_loop;
                             }
                         }
 
-                        // Waits if no key is pressed
-                        if !is_key_pressed {
-                            while self.cycle_buffer >= cycle_delta {
-                                self.clock_buffer += cycle_delta;
-                                self.cycle_buffer -= cycle_delta;
-                            }
+                        // Waits and updates buffers if no key is released
+                        let old_buffer = self.cycle_buffer;
+                        self.cycle_buffer %= cycle_delta;
+                        self.clock_buffer += old_buffer - self.cycle_buffer;
 
-                            while self.clock_buffer > CLOCK_DELTA {
-                                self.clock_buffer -= CLOCK_DELTA;
-                                if self.delay_timer > 0 { self.delay_timer -= 1; }
-                                if self.sound_timer > 0 { self.sound_timer -= 1; }
-                            }
-                            break 'run_loop
+                        while self.clock_buffer >= CLOCK_DELTA {
+                            self.clock_buffer -= CLOCK_DELTA;
+                            if self.delay_timer > 0 { self.delay_timer -= 1; }
                         }
+                        break
                     }
 
                     // opcode LD DT, VX - register x is loaded in the delay timer
-                    0x15 => self.delay_timer = self.general_registers[x as usize],
+                    0x15 => {
+                        self.delay_timer = self.general_registers[x as usize];
+                        self.program_counter += 2;
+                    }
 
                     // opcode LD ST, Vx - register x is loaded in the sound timer
                     // a value of 1 is not responded to on original hardware
                     0x18 => {
-                        self.sound_timer = self.general_registers[x as usize];
-                        if self.sound_timer > 1 {
+                        let sound_timer = self.general_registers[x as usize];
+                        if sound_timer > 1 {
                             // Calculates the number of audio samples in the sound timer's duration
-                            let elapsed_frame_samples = self.clock_buffer % CLOCK_DELTA * (48000.0 / 1000000000.0);
-                            let remaining_samples = self.sound_timer as i32 * (48000 / 60) - elapsed_frame_samples as i32;
+                            let remaining_samples = sound_timer as i32 * (48000 / 60) as i32;
                             self.remaining_samples.store(remaining_samples, Ordering::Release);
                         }
+
+                        self.program_counter += 2;
                     },
 
                     // opcode ADD I, Vx - index register = index register + register x
-                    0x1E => self.index_register += self.general_registers[x as usize] as u16,
+                    0x1E => {
+                        self.index_register += self.general_registers[x as usize] as u16;
+                        self.program_counter += 2;
+                    }
 
                     // opcode LD B, Vx - address of the sprite for the digit in register x is loaded in the index register
                     // index register = register x * 5
-                    0x29 => self.index_register = self.general_registers[x as usize & 0xF] as u16 * 5,
+                    0x29 => {
+                        self.index_register = self.general_registers[x as usize & 0xF] as u16 * 5;
+                        self.program_counter += 2;
+                    }
 
                     // opcode LD F, Vx - the BCD representation of register x is loaded at the index register
                     0x33 => {
@@ -381,6 +454,8 @@ impl Chip8 {
                         self.ram[self.index_register as usize]     = self.general_registers[x as usize] / 100;
                         self.ram[self.index_register as usize + 1] = self.general_registers[x as usize] / 10 % 10;
                         self.ram[self.index_register as usize + 2] = self.general_registers[x as usize] % 10;
+
+                        self.program_counter += 2;
                     },
 
                     // opcode LD [I], Vx - registers 0 to x are loaded at the index register
@@ -395,6 +470,8 @@ impl Chip8 {
                         let destination = &mut self.ram[self.index_register as usize..max_ram_access as usize + 1];
                         destination.copy_from_slice(&self.general_registers[0..x as usize + 1]);
                         self.index_register += x as u16 + 1;
+
+                        self.program_counter += 2;
                     },
 
                     // opcode LD Vx, [I] - memory starting at the index register is loaded in registers 0 to x
@@ -409,14 +486,13 @@ impl Chip8 {
                         let source = &self.ram[self.index_register as usize..max_ram_access as usize + 1];
                         self.general_registers[0..x as usize + 1].copy_from_slice(source);
                         self.index_register += x as u16 + 1;
+
+                        self.program_counter += 2;
                     },
                     _ => return Some("Unsupported opcode!")
                 }
                 _ => return Some("Unsupported opcode!")
             }
-            
-            // Increments program counter by 2
-            self.program_counter += 2;
         }
 
         // Keeps track of the previous keyboard state to know when a key is pressed or released

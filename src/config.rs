@@ -9,6 +9,7 @@ pub struct Chip8Configuration {
     pub window_size: Option<Result<(u32 ,u32), u32>>,
     pub is_fullscreen: bool,
     pub is_drawsync: bool,
+    pub is_shift_quirk: bool,
     pub is_vsync: bool
 }
 
@@ -22,6 +23,7 @@ impl Chip8Configuration {
         let mut window_size = None;
         let mut is_fullscreen = false;
         let mut is_drawsync = true;
+        let mut is_shift_quirk = true;
         let mut is_vsync = true;
 
         let mut args =  env::args().skip(1).peekable();
@@ -78,21 +80,23 @@ impl Chip8Configuration {
                     print!("\
                         chip8-emulator <Rom path> <Options>\n\
                         Options:\n    \
-                        -bg -background   <RGB color> | <Red> <Green> <Blue>  (default: 0, 0, 0)\n    \
-                        -c  -clock        <Cycles per second>                 (default: 500 hz)\n    \
-                        -fg -foreground   <RGB color> | <Red> <Green> <Blue>  (default: 255, 255, 255)\n    \
-                        -fs -fullscreen   Turns on fullscreen mode\n    \
-                        -h  -help         Displays this help message\n        \
-                            -nodrawsync   Turns off the 60hz draw sync\n        \
-                            -novsync      Turns off vertical sync\n    \
-                        -sf -scalefactor  <Scale factor of 64x32 screen>\n    \
-                        -w  -windowsize   <Pixel width> <Pixel height>\
+                        -bg -background    <RGB color> | <Red> <Green> <Blue>  (default: 0, 0, 0)\n    \
+                        -c  -clock         <Cycles per second>                 (default: 500 hz)\n    \
+                        -fg -foreground    <RGB color> | <Red> <Green> <Blue>  (default: 255, 255, 255)\n    \
+                        -fs -fullscreen    Turns on fullscreen mode\n    \
+                        -h  -help          Displays this help message\n        \
+                            -nodrawsync    Turns off the 60hz draw sync\n        \
+                            -noyregshift   Shifts from the x register\n        \
+                            -novsync       Turns off vertical sync\n    \
+                        -sf -scalefactor   <Scale factor of 64x32 screen>\n    \
+                        -w  -windowsize    <Pixel width> <Pixel height>\
                     ");
                     return Err("")
                 }
 
                 "-nodrawsync" => is_drawsync = false,
                 "-novsync" => is_vsync = false,
+                "-noyregshift" => is_shift_quirk = false,
                 
                 "-sf" | "-scalefactor" => {
                     // Reads scale factor argument with or without a space
@@ -172,7 +176,8 @@ impl Chip8Configuration {
             }
         }
 
-        Ok(Chip8Configuration{rom_path, clock_hz: clock_per_sec, background_color, foreground_color, window_size, is_fullscreen, is_drawsync, is_vsync})
+        Ok(Chip8Configuration{rom_path, clock_hz: clock_per_sec, background_color, foreground_color, window_size,
+            is_fullscreen, is_drawsync, is_shift_quirk, is_vsync})
     }
 }
 
